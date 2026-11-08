@@ -19,7 +19,7 @@
 
 This write-up documents the reverse engineering of a Windows console crackme that gates a success message behind a password check. The twist is that the password validator is not a simple string comparison: the binary embeds a tiny, hand-rolled feed-forward neural network ("LLM sentinel") whose output is combined with classic checks (prefix, suffix, character-class table, and a byte checksum) to decide whether the input is accepted. In parallel, a background monitor thread polls a global flag and reacts to anti-analysis conditions by invoking a "sentinel verdict" routine that can terminate the process with a hostile-environment message.
 
-The binary was triaged statically (DIE, PE-bear), the string table was mined for the program's logic hints and all user-facing messages, and the core validation and monitor-thread logic was reconstructed in IDA Pro. The password-check predicate was reduced to a closed set of integer/byte constraints and solved with Z3, and the full "LLM" scoring function (weights, permutation, classifier table, and XOR-obfuscated prefix/suffix constants) was reimplemented in Python directly from the executable's `.rdata` section to independently confirm the solution offline. Two single-byte-opcode patches were additionally identified and applied to neutralize the anti-debug/sentinel interruption path during live debugging.
+The binary was triaged statically (DIE, PE-bear), the string table was mined for the program's logic hints and all user-facing messages, and the core validation and monitor-thread logic was reconstructed in IDA Pro. The password-check predicate was reduced to a closed set of integer/byte constraints and solved with Z3, and the full "LLM" scoring function (weights, permutation, classifier table, and XOR-obfuscated prefix/suffix constants) was reimplemented in Python directly from the executable's `.rdata` section to independently confirm the solution offline. Four byte patches (section 17) were applied to neutralize the sentinel and the attempt limit during live debugging.
 
 ---
 
@@ -84,11 +84,8 @@ The thread's `StartAddress` routine first calls `getenv("CRACKME_AI_VERBOSE")`. 
 
 ![IDA — StartAddress / Verbose Check](images/8.png)
 
-### 9. Patch #1 — Thread Prologue Byte Edit
-While live-debugging `StartAddress` at `0x140001B00` (file offset `0xF00`), the leading `push r12` prologue byte (`41`) of the thread entry was overwritten, changing the opcode sequence from
-`41 54 55 57 56 53 48 83 EC 20 48 8D 0D 5C C6 01` to
-`54 55 57 56 53 48 83 EC 20 48 8D 0D 5C C6 01 …`
-This was an exploratory patch applied during the debugging session to perturb the monitor thread's register setup while tracing the sentinel path; it is recorded here for completeness/reproducibility of the debugging session rather than being a required step to reach `ACCESS GRANTED`.
+### 9. Patch #1 — Monitor Thread Entry Disabled
+While live-debugging `StartAddress` at `0x140001B00` (file offset `0xF00`), the first byte of the thread entry (`41`, the REX prefix of `push r12`) was replaced with `C3` (`ret`). The monitor thread therefore returns immediately after it is created and the sentinel never polls the environment.
 
 ![Patch — Thread Prologue](images/9.png)
 
@@ -148,6 +145,18 @@ This removes the branch that would otherwise divert execution away from the pass
 
 ---
 
+### 17. Complete List of Patches (verified with a byte diff)
+A byte-level comparison of `crackme03.exe` and `crackme03_patched.exe` (`patched.7z`) shows four patched locations:
+
+| VA | File offset | Original | Patched | Effect |
+| :--- | :--- | :--- | :--- | :--- |
+| `0x140001B00` | `0xF00` | `41` (`push r12`) | `C3` (`ret`) | monitor thread returns immediately |
+| `0x140002E50` | `0x2250` | `56` (`push rsi`) | `C3` (`ret`) | sentinel verdict routine (`ExitProcess(3)`) disabled |
+| `0x14001C3B9` | `0x1B7B9` | `0F 85 D3 00 00 00` (`jnz`) | `90 × 6` | sentinel condition removed from the validation block |
+| `0x14001C40F` | `0x1B80F` | `0F 85 D0 FE` (`jnz 0x14001C2E5`) | `E9 D1 FE FF` (`jmp`) | attempt counter check removed (unlimited attempts) |
+
+The patches are only needed for live debugging; the password below is accepted by the unpatched binary's logic as reconstructed offline.
+
 ## Solving the Gate with Z3
 
 The format-gate constraints recovered from `sub_140004360`/`sub_140004B30` reduce to a small SMT problem over 16 bytes:
@@ -201,7 +210,7 @@ if __name__ == "__main__":
     solve_crackme()
 ```
 
-These five constraints (ASCII printability, a fixed 3-byte prefix, a fixed 1-byte suffix, a mod-256 checksum target, and a minimum digit count) are exactly the structural half of the gate implemented in `sub_140004360`. They do **not** yet cover the neural-network scorer in `sub_140004B30` — satisfying them only guarantees the `gate` feature reaches `1.0`; the sigmoid output of the embedded network still has to clear its `0.5` decision threshold for the full predicate (`var_268 != 0`) to hold.
+These five constraints (ASCII printability, a fixed 3-byte prefix, a fixed 1-byte suffix, a mod-256 checksum target, and a minimum digit count) describe the *ideal* values of the network's input features. Only the length (16) is a hard check; the prefix/suffix/character-class flag, the checksum distance from 101 and the digit count are features that the network scores (see the reconstruction below). For example, a candidate whose byte sum is 102 is still accepted (sigmoid ≈ 0.89), while a sum of 105 is rejected (sigmoid ≈ 0.34). They do **not** yet cover the neural-network scorer in `sub_140004B30` — satisfying them only guarantees the `gate` feature reaches `1.0`; the sigmoid output of the embedded network still has to clear its `0.5` decision threshold for the full predicate (`var_268 != 0`) to hold.
 
 ---
 
@@ -376,6 +385,23 @@ Entering this value at the `[1/5] Enter password:` prompt (after applying the an
 
 ---
 
+## Verification: Z3 Models Scored by the Reconstructed Network
+As a cross-check, the Z3 constraints were built from the classifier table, prefix and suffix read from the binary, and every Z3 model was scored by the reconstructed network (Z3 4.15.4):
+
+```
+model   1: AI-1!9A4<!!A3!z!  sum8=101  sigmoid=0.9488  ACCEPTED
+model   2: AI-V8208800@0-0!  sum8=101  sigmoid=0.9511  ACCEPTED
+model   3: AI-V8208008@0-0!  sum8=101  sigmoid=0.9511  ACCEPTED
+200 Z3 model(s) scored by the network, 200 accepted
+AI-2!9A4<!!A3!z!  sum8=102  sigmoid=0.8855  ACCEPTED
+AI-5!9A4<!!A3!z!  sum8=105  sigmoid=0.3389  rejected
+AI-A!9A4<!!A3!z!  sum8=117  sigmoid=0.0000  rejected
+```
+
+All 200 models that satisfy the ideal feature values are accepted, and `AI-99|~?0=PM;g6!` scores 0.9377. In this crackme the network behaves as a soft version of the structural checks.
+
+---
+
 ## Detection Signature (YARA)
 
 ```yara
@@ -431,7 +457,7 @@ rule KamilLLM_Sentinel_Crackme03
 
 * **Static triage:** Detect It Easy v3.10, PE-bear — header/import/section inspection, packer heuristic review.
 * **Disassembly / logic recovery:** IDA Pro — sentinel verdict routine, monitor thread, password loop, two-stage gate.
-* **Live patching:** two single-location byte patches applied directly in the debugger (thread prologue experiment; anti-debug `jnz`→`NOP` bypass at the validation gate).
+* **Live patching:** four byte patches (see section 17).
 * **Constraint solving:** Z3 (`z3-solver`) — reduced the structural half of the gate (prefix/suffix/checksum/digit-count) to a satisfiable bitvector model.
 * **Offline verification:** a pure-Python reimplementation of the embedded 6-8-1 feed-forward network (weights, permutation, and classifier table extracted directly from `.rdata` by VA→file-offset translation) to confirm the solved password clears the sigmoid decision threshold without needing the live binary or a debugger.
 
@@ -439,4 +465,4 @@ rule KamilLLM_Sentinel_Crackme03
 
 ## Provenance
 
-All offsets, seeds, obfuscation constants, and the structure of the embedded feed-forward network documented in this write-up (including `VA_CLASS`, `VA_PREFIX`, `VA_WEIGHTS`, `WEIGHT_SEED`, `PERM_SEED`, the `xorshift32` keystream, and the two patch locations) were independently recovered via static analysis (Detect It Easy, PE-bear, IDA Pro) and live debugging (x64dbg) of the target binary. The accompanying `solve_z3.py` and `extract_model.py` scripts were written from scratch against these recovered values.
+All offsets, seeds, obfuscation constants, and the structure of the embedded feed-forward network documented in this write-up (including `VA_CLASS`, `VA_PREFIX`, `VA_WEIGHTS`, `WEIGHT_SEED`, `PERM_SEED`, the `xorshift32` keystream, and the patch locations) were independently recovered via static analysis (Detect It Easy, PE-bear, IDA Pro) and live debugging (x64dbg) of the target binary. The accompanying `solve_z3.py` and `extract_model.py` scripts were written from scratch against these recovered values.
